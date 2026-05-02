@@ -1,6 +1,6 @@
 # Garantía de consistencia en Redis
  
-> Redis prioriza rendimiento y simplicidad sobre integridad compleja. Esta guía explica cómo garantizar consistencia mediante transacciones, scripts Lua y notificaciones de eventos.
+> Redis es una base de datos orientada a rendimiento, no a integridad compleja. En lugar de SQL, utiliza mecanismos propios para gestionar la consistencia de datos.
  
 ---
  
@@ -8,27 +8,25 @@
  
 - [Descripción](#descripción)
 - [1. Transacciones básicas](#1-transacciones-básicas)
-- [2. Manejo de errores](#2-manejo-de-errores)
+- [2. Control de errores](#2-control-de-errores)
 - [3. Agrupación lógica de transacciones](#3-agrupación-lógica-de-transacciones)
-- [4. Automatización (equivalente a triggers)](#4-automatización-equivalente-a-triggers)
+- [4. Automatización (simulación de triggers)](#4-automatización-simulación-de-triggers)
 - [5. Casos de prueba](#5-casos-de-prueba)
-- [Conclusión técnica](#conclusión-técnica)
+- [Conclusión](#conclusión)
 ---
  
 ## Descripción
  
-En Redis, la consistencia se garantiza mediante:
+En Redis, la consistencia de datos se gestiona mediante mecanismos distintos a los de bases de datos relacionales:
  
-- Transacciones con `MULTI`, `EXEC`, `DISCARD`
-- Manejo de errores limitado (no hay `EXCEPTION`, pero sí validaciones previas)
-- Automatización mediante scripts Lua (equivalente a triggers)
-- Operaciones atómicas
+- Transacciones (`MULTI`, `EXEC`, `DISCARD`)
+- Control de concurrencia (`WATCH`)
+- Scripts Lua (para validación y atomicidad)
+- Notificaciones de eventos (simulación de triggers)
 ---
  
 ## 1. Transacciones básicas
  
-En Redis, las transacciones se manejan así:
- 
 ```redis
 MULTI
 DECRBY cuenta:1 100
@@ -36,30 +34,33 @@ INCRBY cuenta:2 100
 EXEC
 ```
  
-### Explicación
+### Explicación técnica
+ 
+Las transacciones en Redis permiten agrupar múltiples comandos para que se ejecuten de forma atómica.
  
 | Comando | Descripción |
-|--------|-------------|
-| `MULTI` | Inicia la transacción |
-| `DECRBY` / `INCRBY` | Operaciones en cola |
-| `EXEC` | Ejecuta todo de forma atómica |
+|---------|-------------|
+| `MULTI` | Inicia la transacción y pone los comandos en cola |
+| `DECRBY` / `INCRBY` | Operaciones que no se ejecutan inmediatamente |
+| `EXEC` | Ejecuta todos los comandos juntos |
  
-> **Nota:** Si Redis se cae antes de `EXEC`, no se aplica ninguna operación.
+### Objetivo
+ 
+Garantizar que todas las operaciones se ejecuten como un bloque único.
+ 
+> **Limitación:** Redis no valida reglas de negocio (por ejemplo, evitar saldo negativo). Solo asegura atomicidad, no consistencia lógica.
  
 ---
  
-## 2. Manejo de errores
+## 2. Control de errores
  
-Redis no tiene `ROLLBACK` automático, pero ofrece:
- 
-- Validación previa con `WATCH`
-- Cancelación manual con `DISCARD`
-### Ejemplo con WATCH
+### Con WATCH y DISCARD
  
 ```redis
 WATCH cuenta:1
+ 
 GET cuenta:1
-# Supongamos saldo = 50
+# Validación previa en la aplicación
  
 MULTI
 DECRBY cuenta:1 100
@@ -67,15 +68,13 @@ INCRBY cuenta:2 100
 EXEC
 ```
  
-Si el saldo es insuficiente, cancela la transacción manualmente:
+Si ocurre un problema, cancelar con:
  
 ```redis
 DISCARD
 ```
  
-### Alternativa recomendada: Script Lua
- 
-Los scripts Lua se ejecutan de forma atómica en Redis y permiten combinar validación, transacción y control de errores en un solo bloque.
+### Recomendado: Script Lua
  
 ```lua
 EVAL "
@@ -89,11 +88,25 @@ return 'Transferencia exitosa'
 " 2 cuenta:1 cuenta:2 100
 ```
  
+### Explicación técnica
+ 
+Redis no dispone de `ROLLBACK` automático ni bloques `EXCEPTION`. Para manejar errores se utilizan:
+ 
+| Mecanismo | Descripción |
+|-----------|-------------|
+| `WATCH` | Detecta cambios en claves (control de concurrencia) |
+| `DISCARD` | Cancela la transacción antes de ejecutarse |
+| Scripts Lua | Validan condiciones y ejecutan lógica completa de forma atómica |
+ 
+### Objetivo
+ 
+Evitar inconsistencias como saldo negativo u operaciones incompletas.
+ 
 ---
  
 ## 3. Agrupación lógica de transacciones
  
-### Caso real: transferencia bancaria
+### Transferencia simple
  
 ```redis
 MULTI
@@ -102,7 +115,7 @@ INCRBY cuenta:2 200
 EXEC
 ```
  
-### Caso más seguro con Lua
+### Transferencia segura con Lua
  
 ```lua
 EVAL "
@@ -116,11 +129,19 @@ end
 " 2 cuenta:1 cuenta:2 200
 ```
  
+### Explicación técnica
+ 
+Este apartado simula un caso real: una transferencia bancaria. La operación implica restar dinero de una cuenta y sumarlo a otra. Ambas deben ejecutarse juntas para mantener coherencia.
+ 
+### Objetivo
+ 
+Garantizar que operaciones relacionadas no queden a medias y mantengan consistencia.
+ 
+> **Recomendacion:** Lua es la mejor opción porque valida y ejecuta todo en un solo paso atómico.
+ 
 ---
  
-## 4. Automatización (equivalente a triggers)
- 
-Redis no tiene triggers nativos, pero pueden simularse con dos enfoques.
+## 4. Automatización (simulación de triggers)
  
 ### Opción 1: Keyspace Notifications
  
@@ -136,11 +157,7 @@ Suscribirse a eventos:
 PSUBSCRIBE __keyevent@0__:set
 ```
  
-> Detecta cuando se insertan o modifican claves en la base de datos.
- 
 ### Opción 2: Script Lua
- 
-Permite ejecutar lógica adicional (como auditoría) junto con la operación principal:
  
 ```lua
 EVAL "
@@ -150,11 +167,24 @@ return 'Insertado con auditoria'
 " 1 cliente:1 "Juan"
 ```
  
+### Explicación técnica
+ 
+Redis no tiene triggers como SQL, pero se pueden simular mediante:
+ 
+| Mecanismo | Descripción |
+|-----------|-------------|
+| Keyspace Notifications | Detectan eventos en claves |
+| Scripts Lua | Ejecutan lógica adicional automáticamente |
+ 
+### Objetivo
+ 
+Automatizar tareas como auditoría, registro de eventos y validaciones automáticas.
+ 
 ---
  
 ## 5. Casos de prueba
  
-### Caso 1: transacción exitosa
+### Caso 1: ejecución correcta
  
 ```redis
 SET cuenta:1 500
@@ -166,16 +196,18 @@ INCRBY cuenta:2 100
 EXEC
 ```
  
-**Resultado esperado:**
+**Resultado:**
  
 ```
 cuenta:1 → 400
 cuenta:2 → 200
 ```
  
+Transacción exitosa.
+ 
 ---
  
-### Caso 2: error lógico sin validación
+### Caso 2: error sin control
  
 ```redis
 SET cuenta:1 50
@@ -192,13 +224,13 @@ EXEC
 cuenta:1 → -50
 ```
  
-> **Advertencia:** Redis no evita inconsistencias por si solo. El saldo queda en negativo.
+> **Advertencia:** Redis no evita inconsistencias por si solo.
  
 ---
  
 ### Caso 3: error controlado con Lua
  
-Con saldo insuficiente, el script Lua retorna:
+Con saldo insuficiente, el script retorna:
  
 ```
 "Error: saldo insuficiente"
@@ -214,30 +246,27 @@ La operación no se ejecuta y los datos permanecen consistentes.
 SET cliente:1 "Ana"
 ```
  
-Evento capturado por Keyspace Notifications:
+**Resultado esperado:**
  
 ```
-"Se modificó una clave"
+"Nuevo registro insertado"
 ```
+ 
+### Explicación técnica
+ 
+Los casos de prueba permiten verificar el funcionamiento correcto, el comportamiento ante errores, la efectividad de las validaciones y la reacción de las automatizaciones.
+ 
+### Objetivo
+ 
+Demostrar cómo Redis maneja (o no) la consistencia, y por qué requiere lógica adicional para garantizar integridad.
  
 ---
  
-## Conclusión técnica
+## Conclusión
  
-| Concepto SQL | Equivalente en Redis |
-|---|---|
-| `BEGIN` / `COMMIT` | `MULTI` / `EXEC` |
-| `ROLLBACK` | `DISCARD` (limitado) |
-| `EXCEPTION` | Scripts Lua + validaciones |
-| `TRIGGERS` | Keyspace Notifications / Lua |
-| Transacciones ACID | Parcial (atomicidad básica) |
+Redis prioriza rendimiento sobre integridad compleja. Para garantizar consistencia real, seguir estas buenas practicas:
  
-### Recomendaciones
- 
-Para garantizar consistencia real en Redis:
- 
-1. Usa **scripts Lua** para operaciones que requieran validación y atomicidad
-2. Evita lógica crítica distribuida en múltiples comandos separados
-3. Implementa **validaciones previas** antes de ejecutar operaciones sensibles
-4. Usa **Keyspace Notifications** para reaccionar a cambios de estado
+1. Usar **scripts Lua** para operaciones críticas
+2. **Validar datos** antes de ejecutar
+3. Evitar dividir lógica en **múltiples comandos separados**
  
